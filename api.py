@@ -6,14 +6,13 @@ import pdfplumber
 from groq import Groq
 from dotenv import load_dotenv
 
-# .env dosyasını yükle (Yerel çalışma için)
+# .env dosyasını yükle
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # --- VERİTABANI AYARLARI ---
-# ÖNEMLİ: Hata düzeltildi, doğru anahtar SQLALCHEMY_DATABASE_URI
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tahlil_verileri.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
@@ -28,7 +27,7 @@ class User(db.Model):
     password = db.Column(db.String(120), nullable=False)
     cinsiyet = db.Column(db.String(10))
     dogum_yili = db.Column(db.Integer)
-    hastaliklar = db.Column(db.Text)  # Virgülle ayrılmış liste
+    hastaliklar = db.Column(db.Text)
 
 class Hastalik(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -43,24 +42,31 @@ class TahlilVerisi(db.Model):
     birim = db.Column(db.String(20))
     referans = db.Column(db.String(50))
 
-# Veritabanını oluştur ve başlangıç verilerini ekle
+# Veritabanını oluştur ve Genişletilmiş Hastalık Listesini Ekle
 with app.app_context():
     db.create_all()
-    if not Hastalik.query.first():
-        varsayilanlar = ["Diyabet", "Hipertansiyon", "Anemi", "Tiroid", "Kolesterol"]
-        for h in varsayilanlar:
-            db.session.add(Hastalik(isim=h))
-        db.session.commit()
+    # En sık görülen kronik hastalıklar listesi
+    kronik_hastaliklar = [
+        "Diyabet (Tip 1/2)", "Hipertansiyon", "Anemi (Kansızlık)",
+        "Hipotiroidi / Hipertiroidi", "Hiperlipidemi (Yüksek Kolesterol)",
+        "Astım", "KOAH", "Kronik Kalp Yetmezliği", "Koroner Arter Hastalığı",
+        "Romatoid Artrit", "Migren", "Kronik Böbrek Yetmezliği",
+        "Karaciğer Yağlanması", "Çölyak", "Gastrit / Ülser",
+        "Egzama / Sedef", "Anksiyete Bozukluğu", "Depresyon",
+        "Obezite", "Uyku Apnesi", "Huzursuz Bacak Sendromu",
+        "İnsülin Direnci", "B12 Eksikliği", "D Vitamini Eksikliği"
+    ]
+    
+    for h_isim in kronik_hastaliklar:
+        mevcut = Hastalik.query.filter_by(isim=h_isim).first()
+        if not mevcut:
+            db.session.add(Hastalik(isim=h_isim))
+    db.session.commit()
 
-# --- API ROTLARI ---
+# --- AUTH ROTLARI ---
 
-@app.route('/hastaliklari_getir', methods=['GET'])
-def hastaliklari_getir():
-    hastaliklar = Hastalik.query.all()
-    return jsonify([h.isim for h in hastaliklar])
-
-@app.route('/kayit', methods=['POST'])
-def kayit():
+@app.route('/register', methods=['POST'])
+def register():
     data = request.json
     if User.query.filter_by(username=data['username']).first():
         return jsonify({"mesaj": "Bu kullanıcı adı zaten alınmış"}), 400
@@ -76,13 +82,20 @@ def kayit():
     db.session.commit()
     return jsonify({"mesaj": "Kayıt başarılı", "user_id": yeni_user.id})
 
-@app.route('/giris', methods=['POST'])
-def giris():
+@app.route('/login', methods=['POST'])
+def login():
     data = request.json
     user = User.query.filter_by(username=data['username'], password=data['password']).first()
     if user:
         return jsonify({"mesaj": "Giriş başarılı", "user_id": user.id})
     return jsonify({"mesaj": "Hatalı bilgiler"}), 401
+
+# --- DİĞER ROTLAR ---
+
+@app.route('/hastaliklari_getir', methods=['GET'])
+def hastaliklari_getir():
+    hastaliklar = Hastalik.query.order_by(Hastalik.isim).all()
+    return jsonify([h.isim for h in hastaliklar])
 
 @app.route('/pdf_yukle', methods=['POST'])
 def pdf_yukle():
@@ -93,11 +106,11 @@ def pdf_yukle():
     tarih = "Bilinmiyor"
     
     with pdfplumber.open(file) as pdf:
-        full_text = ""
+        text = ""
         for page in pdf.pages:
-            full_text += page.extract_text() or ""
-        
-        lines = full_text.split('\n')
+            text += page.extract_text() or ""
+
+        lines = text.split('\n')
         for line in lines:
             if "Tarih" in line and tarih == "Bilinmiyor":
                 tarih = line.split(':')[-1].strip()
@@ -106,8 +119,7 @@ def pdf_yukle():
             if len(parts) >= 4:
                 try:
                     param = parts[0]
-                    val_str = parts[1].replace(',', '.')
-                    deger = float(val_str)
+                    deger = float(parts[1].replace(',', '.'))
                     birim = parts[2]
                     ref = parts[3]
                     
@@ -122,7 +134,7 @@ def pdf_yukle():
                     db.session.add(yeni_veri)
                 except: continue
         db.session.commit()
-    return jsonify({"mesaj": f"{tarih} tarihli tahlil başarıyla işlendi."})
+    return jsonify({"mesaj": f"{tarih} tarihli tahlil işlendi."})
 
 @app.route('/matris_getir', methods=['GET'])
 def matris_getir():
@@ -143,9 +155,9 @@ def matris_getir():
                 riskli = False
                 if "-" in v.referans:
                     try:
-                        parts = v.referans.split("-")
-                        alt = float(parts[0].strip())
-                        ust = float(parts[1].strip())
+                        pts = v.referans.split("-")
+                        alt = float(pts[0].strip())
+                        ust = float(pts[1].strip())
                         if v.deger < alt or v.deger > ust: riskli = True
                     except: pass
                 hucreler.append({"deger": str(v.deger), "riskli": riskli})
@@ -154,12 +166,6 @@ def matris_getir():
         satirlar.append({"isim": p, "referans": referans, "hucreler": hucreler})
         
     return jsonify({"sutunlar": tarihler, "satirlar": satirlar})
-
-@app.route('/parametre_gecmisi/<parametre>', methods=['GET'])
-def parametre_gecmisi(parametre):
-    user_id = request.args.get("user_id")
-    veriler = TahlilVerisi.query.filter_by(kullanici_id=user_id, parametre=parametre).all()
-    return jsonify([{"tarih": v.tarih, "deger": v.deger, "birim": v.birim, "referans": v.referans} for v in veriler])
 
 @app.route('/profil', methods=['GET'])
 def profil():
@@ -174,14 +180,6 @@ def profil():
         })
     return jsonify({"hata": "Profil bulunamadı"}), 404
 
-@app.route('/sil_tarih', methods=['DELETE'])
-def sil_tarih():
-    user_id = request.args.get("user_id")
-    tarih = request.args.get("tarih")
-    TahlilVerisi.query.filter_by(kullanici_id=user_id, tarih=tarih).delete()
-    db.session.commit()
-    return jsonify({"mesaj": "Veriler temizlendi"})
-
 @app.route('/sohbet', methods=['POST'])
 def sohbet():
     data = request.json
@@ -191,12 +189,11 @@ def sohbet():
     user = User.query.get(u_id)
     tahliller = TahlilVerisi.query.filter_by(kullanici_id=u_id).all()
     
-    # RAG Mantığı: SQL verilerini metne dönüştürerek Context oluşturma
-    tahlil_ozeti = ""
+    tahlil_metni = ""
     for v in tahliller:
-        tahlil_ozeti += f"- Tarih: {v.tarih}, {v.parametre}: {v.deger} {v.birim} (Ref: {v.referans})\n"
+        tahlil_metni += f"- {v.tarih}: {v.parametre} {v.deger} {v.birim} (Ref: {v.referans})\n"
     
-    profil_bilgisi = f"Yaş: {2026 - user.dogum_yili}, Cinsiyet: {user.cinsiyet}, Hastalıklar: {user.hastaliklar}"
+    profil = f"Yaş: {2026 - user.dogum_yili}, Cinsiyet: {user.cinsiyet}, Hastalıklar: {user.hastaliklar}"
 
     try:
         completion = client.chat.completions.create(
@@ -205,11 +202,10 @@ def sohbet():
                 {
                     "role": "system", 
                     "content": (
-                        "Sen uzman bir tahlil yorumlama asistanısın. Kullanıcının profilini ve tahlillerini "
-                        "baz alarak soruları yanıtla. Tıbbi tavsiye vermediğini, sadece verileri açıkladığını belirt. "
-                        "Riskli (referans dışı) değerleri fark et ve kullanıcıyı uyar.\n\n"
-                        f"HASTA PROFİLİ: {profil_bilgisi}\n"
-                        f"LABORATUVAR SONUÇLARI:\n{tahlil_ozeti}"
+                        "Sen uzman bir tahlil analiz asistanısın. Kullanıcının profilini "
+                        "ve geçmiş tahlillerini analiz ederek soruları yanıtla. "
+                        "Anlaşılır bir dil kullan ve riskli durumlarda doktora yönlendir.\n\n"
+                        f"HASTA PROFİLİ: {profil}\nSONUÇLAR:\n{tahlil_metni}"
                     )
                 },
                 {"role": "user", "content": soru}
@@ -217,7 +213,7 @@ def sohbet():
         )
         return jsonify({"cevap": completion.choices[0].message.content})
     except Exception as e:
-        return jsonify({"cevap": f"Hizmet şu an meşgul. (Hata: {str(e)})"}), 500
+        return jsonify({"cevap": f"Bir hata oluştu: {str(e)}"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
