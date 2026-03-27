@@ -1,6 +1,14 @@
 import re
 import pdfplumber
 from datetime import datetime
+import os
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# Model ve Dosya Yolu
+model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+FAISS_INDEX_PATH = "tahlil_hafizasi.index"
 
 def is_abnormal(deger, referans_str):
     try:
@@ -12,6 +20,40 @@ def is_abnormal(deger, referans_str):
             return not (low <= deger <= high)
         return False
     except: return False
+
+def metni_vektore_cevir(metin):
+    return model.encode([metin])[0]
+
+def faiss_indeksine_ekle(vektor, sqlite_id):
+    boyut = vektor.shape[0]
+    if os.path.exists(FAISS_INDEX_PATH):
+        index = faiss.read_index(FAISS_INDEX_PATH)
+    else:
+        index = faiss.IndexIDMap(faiss.IndexFlatL2(boyut))
+
+    vektor_hazir = np.array([vektor]).astype('float32')
+    id_hazir = np.array([sqlite_id]).astype('int64')
+
+    index.add_with_ids(vektor_hazir, id_hazir)
+    faiss.write_index(index, FAISS_INDEX_PATH)
+
+# --- YENİ: FAISS İÇİNDE ARAMA YAPMA FONKSİYONU ---
+def faiss_ara(soru_metni, k=3):
+    """
+    Kullanıcının sorusuna en yakın k adet tahlil kaydının SQLite ID'sini döner.
+    """
+    if not os.path.exists(FAISS_INDEX_PATH):
+        return []
+
+    index = faiss.read_index(FAISS_INDEX_PATH)
+    soru_vektoru = np.array([metni_vektore_cevir(soru_metni)]).astype('float32')
+    
+    # L2 mesafesine göre en yakın k sonucu bul (distances: uzaklık, indices: SQLite ID'leri)
+    distances, indices = index.search(soru_vektoru, k)
+    
+    # -1 olan (boş) sonuçları temizleyip ID listesini döndür
+    return [int(idx) for idx in indices[0] if idx != -1]
+# ------------------------------------------------
 
 def parse_pdf_data(pdf_stream):
     sonuclar_listesi = []
