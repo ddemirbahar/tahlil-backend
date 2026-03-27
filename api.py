@@ -12,12 +12,13 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Veritabanı Ayarları (SQLite)
-app.config['SQLALCHEMY_DATABASE_DATABASE_URI'] = 'sqlite:///tahlil_verileri.db'
+# --- VERİTABANI AYARLARI ---
+# ÖNEMLİ: Hata düzeltildi, doğru anahtar SQLALCHEMY_DATABASE_URI
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tahlil_verileri.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Groq İstemcisi (Render'daki Environment Variable'dan alır)
+# Groq İstemcisi
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # --- VERİTABANI MODELLERİ ---
@@ -42,12 +43,12 @@ class TahlilVerisi(db.Model):
     birim = db.Column(db.String(20))
     referans = db.Column(db.String(50))
 
+# Veritabanını oluştur ve başlangıç verilerini ekle
 with app.app_context():
     db.create_all()
-    # Varsayılan hastalıkları ekle (eğer boşsa)
     if not Hastalik.query.first():
-        liste = ["Diyabet", "Hipertansiyon", "Anemi", "Tiroid", "Kolesterol"]
-        for h in liste:
+        varsayilanlar = ["Diyabet", "Hipertansiyon", "Anemi", "Tiroid", "Kolesterol"]
+        for h in varsayilanlar:
             db.session.add(Hastalik(isim=h))
         db.session.commit()
 
@@ -92,25 +93,21 @@ def pdf_yukle():
     tarih = "Bilinmiyor"
     
     with pdfplumber.open(file) as pdf:
-        text = ""
+        full_text = ""
         for page in pdf.pages:
-            text += page.extract_text() or ""
-            # Tarih bulma (Basit mantık)
-            if "Tarih" in text and tarih == "Bilinmiyor":
-                lines = text.split('\n')
-                for line in lines:
-                    if "Tarih" in line:
-                        tarih = line.split(':')[-1].strip()
-
-        # PDF'den veri çekme (Tablo yapısına göre özelleştirilebilir)
-        lines = text.split('\n')
+            full_text += page.extract_text() or ""
+        
+        lines = full_text.split('\n')
         for line in lines:
+            if "Tarih" in line and tarih == "Bilinmiyor":
+                tarih = line.split(':')[-1].strip()
+            
             parts = line.split()
             if len(parts) >= 4:
                 try:
-                    # Örnek: "Glikoz 95 mg/dL 70-100"
                     param = parts[0]
-                    deger = float(parts[1].replace(',', '.'))
+                    val_str = parts[1].replace(',', '.')
+                    deger = float(val_str)
                     birim = parts[2]
                     ref = parts[3]
                     
@@ -125,7 +122,7 @@ def pdf_yukle():
                     db.session.add(yeni_veri)
                 except: continue
         db.session.commit()
-    return jsonify({"mesaj": f"{tarih} tarihli tahlil işlendi."})
+    return jsonify({"mesaj": f"{tarih} tarihli tahlil başarıyla işlendi."})
 
 @app.route('/matris_getir', methods=['GET'])
 def matris_getir():
@@ -143,11 +140,10 @@ def matris_getir():
             v = TahlilVerisi.query.filter_by(kullanici_id=user_id, parametre=p, tarih=t).first()
             if v:
                 referans = v.referans
-                # Risk kontrolü (Basit)
                 riskli = False
                 if "-" in v.referans:
-                    parts = v.referans.split("-")
                     try:
+                        parts = v.referans.split("-")
                         alt = float(parts[0].strip())
                         ust = float(parts[1].strip())
                         if v.deger < alt or v.deger > ust: riskli = True
@@ -163,21 +159,20 @@ def matris_getir():
 def parametre_gecmisi(parametre):
     user_id = request.args.get("user_id")
     veriler = TahlilVerisi.query.filter_by(kullanici_id=user_id, parametre=parametre).all()
-    sonuc = [{"tarih": v.tarih, "deger": v.deger, "birim": v.birim, "referans": v.referans} for v in veriler]
-    return jsonify(sonuc)
+    return jsonify([{"tarih": v.tarih, "deger": v.deger, "birim": v.birim, "referans": v.referans} for v in veriler])
 
 @app.route('/profil', methods=['GET'])
 def profil():
     user_id = request.args.get("user_id")
-    user = User.query.get(user_id)
-    if user:
+    u = User.query.get(user_id)
+    if u:
         return jsonify({
-            "username": user.username,
-            "cinsiyet": user.cinsiyet,
-            "dogum_yili": user.dogum_yili,
-            "hastaliklar": user.hastaliklar
+            "username": u.username,
+            "cinsiyet": u.cinsiyet,
+            "dogum_yili": u.dogum_yili,
+            "hastaliklar": u.hastaliklar
         })
-    return jsonify({"hata": "Kullanıcı bulunamadı"}), 404
+    return jsonify({"hata": "Profil bulunamadı"}), 404
 
 @app.route('/sil_tarih', methods=['DELETE'])
 def sil_tarih():
@@ -185,25 +180,23 @@ def sil_tarih():
     tarih = request.args.get("tarih")
     TahlilVerisi.query.filter_by(kullanici_id=user_id, tarih=tarih).delete()
     db.session.commit()
-    return jsonify({"mesaj": f"{tarih} tarihli veriler silindi"})
-
-# --- YENİ: YAPAY ZEKA SOHBET ROTU (PLAN B) ---
+    return jsonify({"mesaj": "Veriler temizlendi"})
 
 @app.route('/sohbet', methods=['POST'])
 def sohbet():
     data = request.json
-    user_id = data.get("user_id")
+    u_id = data.get("user_id")
     soru = data.get("soru")
     
-    user = User.query.get(user_id)
-    tahliller = TahlilVerisi.query.filter_by(kullanici_id=user_id).all()
+    user = User.query.get(u_id)
+    tahliller = TahlilVerisi.query.filter_by(kullanici_id=u_id).all()
     
-    # RAG: Veritabanındaki tahlilleri metin haline getir (Context)
-    tahlil_metni = ""
+    # RAG Mantığı: SQL verilerini metne dönüştürerek Context oluşturma
+    tahlil_ozeti = ""
     for v in tahliller:
-        tahlil_metni += f"- {v.tarih} | {v.parametre}: {v.deger} {v.birim} (Ref: {v.referans})\n"
+        tahlil_ozeti += f"- Tarih: {v.tarih}, {v.parametre}: {v.deger} {v.birim} (Ref: {v.referans})\n"
     
-    kullanici_profili = f"Yaş: {2026 - user.dogum_yili}, Cinsiyet: {user.cinsiyet}, Mevcut Hastalıklar: {user.hastaliklar}"
+    profil_bilgisi = f"Yaş: {2026 - user.dogum_yili}, Cinsiyet: {user.cinsiyet}, Hastalıklar: {user.hastaliklar}"
 
     try:
         completion = client.chat.completions.create(
@@ -212,21 +205,19 @@ def sohbet():
                 {
                     "role": "system", 
                     "content": (
-                        "Sen profesyonel bir tahlil yorumlama asistanısın. Kullanıcının aşağıda verilen "
-                        "profil bilgilerini ve tahlil geçmişini analiz ederek sorularını yanıtla. "
-                        "Tıbbi tavsiye vermediğini, sadece sonuçları açıkladığını hatırlat. "
-                        "Anlaşılır, nazik ve destekleyici bir dil kullan.\n\n"
-                        f"KULLANICI PROFİLİ: {kullanici_profili}\n"
-                        f"TAHLİL VERİLERİ:\n{tahlil_metni}"
+                        "Sen uzman bir tahlil yorumlama asistanısın. Kullanıcının profilini ve tahlillerini "
+                        "baz alarak soruları yanıtla. Tıbbi tavsiye vermediğini, sadece verileri açıkladığını belirt. "
+                        "Riskli (referans dışı) değerleri fark et ve kullanıcıyı uyar.\n\n"
+                        f"HASTA PROFİLİ: {profil_bilgisi}\n"
+                        f"LABORATUVAR SONUÇLARI:\n{tahlil_ozeti}"
                     )
                 },
                 {"role": "user", "content": soru}
             ]
         )
-        cevap = completion.choices[0].message.content
-        return jsonify({"cevap": cevap})
+        return jsonify({"cevap": completion.choices[0].message.content})
     except Exception as e:
-        return jsonify({"cevap": f"Üzgünüm, şu an yanıt veremiyorum. (Hata: {str(e)})"}), 500
+        return jsonify({"cevap": f"Hizmet şu an meşgul. (Hata: {str(e)})"}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
