@@ -1,219 +1,236 @@
 import os
+import logging
 from flask import Flask, request, jsonify
-from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
-import pdfplumber
-from groq import Groq
-from dotenv import load_dotenv
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime
 
-# .env dosyasını yükle
-load_dotenv()
+
+from models import db, User, TahlilRaporu, TestParametresi, Hastalik
+from utils import parse_pdf_data, is_abnormal
 
 app = Flask(__name__)
 CORS(app)
 
-# --- VERİTABANI AYARLARI ---
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///tahlil_verileri.db'
+# --- Loglama Ayarları ---
+logging.basicConfig(level=logging.INFO)
+logger = app.logger
+
+basedir = os.path.abspath(os.path.dirname(__file__))
+# Veritabanı dosyası adı
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'tahliller.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
 
-# Groq İstemcisi
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+db.init_app(app)
 
-# --- VERİTABANI MODELLERİ ---
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(120), nullable=False)
-    cinsiyet = db.Column(db.String(10))
-    dogum_yili = db.Column(db.Integer)
-    hastaliklar = db.Column(db.Text)
+# --- VERİTABANI BAŞLATMA VE HASTALIKLARI EKLEME (SEED) ---
+def veritabani_baslat():
+    with app.app_context():
+        db.create_all()
+        
+        # Eğer hastalık tablosu boşsa standart listeyi ekle
+        if not Hastalik.query.first():
+            temel_hastaliklar = [
+                "Diyabet (Şeker)",
+                "Hipertansiyon (Tansiyon)",
+                "Kalp Yetmezliği",
+                "KOAH / Astım",
+                "Böbrek Yetmezliği",
+                "Tiroid (Guatr/Haşimato)",
+                "Yüksek Kolesterol",
+                "Demir Eksikliği Anemisi",
+                "B12 Eksikliği",
+                "Karaciğer Yağlanması"
+            ]
+            for h_adi in temel_hastaliklar:
+                db.session.add(Hastalik(ad=h_adi))
+            db.session.commit()
+            print(">>> Standart hastalık listesi veritabanına eklendi.")
 
-class Hastalik(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    isim = db.Column(db.String(100), unique=True)
+# ---  Hastalık Listesini Getir ---
+@app.route('/diseases', methods=['GET'])
+def get_diseases():
+    try:
+        hastaliklar = Hastalik.query.all()
+        # Sadece isimleri liste olarak döndür
+        liste = [h.ad for h in hastaliklar]
+        return jsonify(liste), 200
+    except Exception as e:
+        logger.error(f"Hastalık listesi hatası: {e}")
+        return jsonify([]), 500
 
-class TahlilVerisi(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    kullanici_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    tarih = db.Column(db.String(20))
-    parametre = db.Column(db.String(100))
-    deger = db.Column(db.Float)
-    birim = db.Column(db.String(20))
-    referans = db.Column(db.String(50))
-
-# Veritabanını oluştur ve Genişletilmiş Hastalık Listesini Ekle
-with app.app_context():
-    db.create_all()
-    # En sık görülen kronik hastalıklar listesi
-    kronik_hastaliklar = [
-        "Diyabet (Tip 1/2)", "Hipertansiyon", "Anemi (Kansızlık)",
-        "Hipotiroidi / Hipertiroidi", "Hiperlipidemi (Yüksek Kolesterol)",
-        "Astım", "KOAH", "Kronik Kalp Yetmezliği", "Koroner Arter Hastalığı",
-        "Romatoid Artrit", "Migren", "Kronik Böbrek Yetmezliği",
-        "Karaciğer Yağlanması", "Çölyak", "Gastrit / Ülser",
-        "Egzama / Sedef", "Anksiyete Bozukluğu", "Depresyon",
-        "Obezite", "Uyku Apnesi", "Huzursuz Bacak Sendromu",
-        "İnsülin Direnci", "B12 Eksikliği", "D Vitamini Eksikliği"
-    ]
-    
-    for h_isim in kronik_hastaliklar:
-        mevcut = Hastalik.query.filter_by(isim=h_isim).first()
-        if not mevcut:
-            db.session.add(Hastalik(isim=h_isim))
-    db.session.commit()
-
-# --- AUTH ROTLARI ---
-
+# --- AUTH (Kayıt Ol) ---
 @app.route('/register', methods=['POST'])
 def register():
-    data = request.json
-    if User.query.filter_by(username=data['username']).first():
-        return jsonify({"mesaj": "Bu kullanıcı adı zaten alınmış"}), 400
+    data = request.get_json()
     
-    yeni_user = User(
-        username=data['username'],
-        password=data['password'],
-        cinsiyet=data.get('cinsiyet'),
+    if User.query.filter_by(username=data['username']).first():
+        logger.warning(f"Kayıt başarısız: {data['username']} zaten var.")
+        return jsonify({"hata": "Kullanıcı adı kullanımda"}), 400
+    
+    # Yeni alanları (email, yaş, cinsiyet, hastalıklar) kaydediyoruz
+    new_user = User(
+        username=data['username'], 
+        password_hash=generate_password_hash(data['password']),
+        email=data.get('email'),
         dogum_yili=data.get('dogum_yili'),
-        hastaliklar=",".join(data.get('hastaliklar', []))
+        cinsiyet=data.get('cinsiyet'),
+        hastaliklar=data.get('hastaliklar') # Frontend'den string olarak gelecek
     )
-    db.session.add(yeni_user)
+    
+    db.session.add(new_user)
     db.session.commit()
-    return jsonify({"mesaj": "Kayıt başarılı", "user_id": yeni_user.id})
+    logger.info(f"Yeni kullanıcı kayıt oldu: {data['username']}")
+    return jsonify({"mesaj": "Kayıt başarılı"}), 201
 
 @app.route('/login', methods=['POST'])
 def login():
-    data = request.json
-    user = User.query.filter_by(username=data['username'], password=data['password']).first()
-    if user:
-        return jsonify({"mesaj": "Giriş başarılı", "user_id": user.id})
-    return jsonify({"mesaj": "Hatalı bilgiler"}), 401
-
-# --- DİĞER ROTLAR ---
-
-@app.route('/hastaliklari_getir', methods=['GET'])
-def hastaliklari_getir():
-    hastaliklar = Hastalik.query.order_by(Hastalik.isim).all()
-    return jsonify([h.isim for h in hastaliklar])
-
-@app.route('/pdf_yukle', methods=['POST'])
-def pdf_yukle():
-    kullanici_id = request.form.get("user_id")
-    if 'file' not in request.files: return jsonify({"hata": "Dosya yok"}), 400
+    data = request.get_json()
+    user = User.query.filter_by(username=data.get('username')).first()
+    if user and check_password_hash(user.password_hash, data.get('password')):
+        logger.info(f"Giriş başarılı: {user.username}")
+        return jsonify({"mesaj": "Giriş başarılı", "username": user.username}), 200
     
+    logger.warning(f"Hatalı giriş denemesi: {data.get('username')}")
+    return jsonify({"hata": "Hatalı giriş"}), 401
+
+# --- YENİ EKLENEN: KULLANICI DETAYLARINI GETİR ---
+@app.route('/user_info', methods=['GET'])
+def get_user_info():
+    username = request.args.get('username')
+    if not username:
+        return jsonify({"hata": "Kullanıcı adı gerekli"}), 400
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({"hata": "Kullanıcı bulunamadı"}), 404
+
+    return jsonify({
+        "username": user.username,
+        "email": user.email,
+        "dogum_yili": user.dogum_yili,
+        "cinsiyet": user.cinsiyet,
+        "hastaliklar": user.hastaliklar # "Diyabet,Tansiyon" şeklinde string döner
+    }), 200
+# -------------------------------------------------
+
+# --- DOSYA YÜKLEME ---
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    username = request.form.get('username')
+    if not username: return jsonify({"hata": "Kullanıcı girişi gerekli"}), 401
+    
+    user = User.query.filter_by(username=username).first()
+    if not user: return jsonify({"hata": "Kullanıcı bulunamadı"}), 404
+
     file = request.files['file']
-    tarih = "Bilinmiyor"
-    
-    with pdfplumber.open(file) as pdf:
-        text = ""
-        for page in pdf.pages:
-            text += page.extract_text() or ""
-
-        lines = text.split('\n')
-        for line in lines:
-            if "Tarih" in line and tarih == "Bilinmiyor":
-                tarih = line.split(':')[-1].strip()
-            
-            parts = line.split()
-            if len(parts) >= 4:
-                try:
-                    param = parts[0]
-                    deger = float(parts[1].replace(',', '.'))
-                    birim = parts[2]
-                    ref = parts[3]
-                    
-                    yeni_veri = TahlilVerisi(
-                        kullanici_id=kullanici_id,
-                        tarih=tarih,
-                        parametre=param,
-                        deger=deger,
-                        birim=birim,
-                        referans=ref
-                    )
-                    db.session.add(yeni_veri)
-                except: continue
-        db.session.commit()
-    return jsonify({"mesaj": f"{tarih} tarihli tahlil işlendi."})
-
-@app.route('/matris_getir', methods=['GET'])
-def matris_getir():
-    user_id = request.args.get("user_id")
-    veriler = TahlilVerisi.query.filter_by(kullanici_id=user_id).all()
-    
-    tarihler = sorted(list(set([v.tarih for v in veriler])))
-    parametreler = sorted(list(set([v.parametre for v in veriler])))
-    
-    satirlar = []
-    for p in parametreler:
-        hucreler = []
-        referans = ""
-        for t in tarihler:
-            v = TahlilVerisi.query.filter_by(kullanici_id=user_id, parametre=p, tarih=t).first()
-            if v:
-                referans = v.referans
-                riskli = False
-                if "-" in v.referans:
-                    try:
-                        pts = v.referans.split("-")
-                        alt = float(pts[0].strip())
-                        ust = float(pts[1].strip())
-                        if v.deger < alt or v.deger > ust: riskli = True
-                    except: pass
-                hucreler.append({"deger": str(v.deger), "riskli": riskli})
-            else:
-                hucreler.append({"deger": "-", "riskli": False})
-        satirlar.append({"isim": p, "referans": referans, "hucreler": hucreler})
+    try:
+        hasta_adi, sonuclar = parse_pdf_data(file.stream)
+        if not sonuclar: 
+            logger.warning("PDF yüklendi ama veri bulunamadı.")
+            return jsonify({"hata": "Veri yok"}), 400
         
-    return jsonify({"sutunlar": tarihler, "satirlar": satirlar})
+        yeni_rapor = TahlilRaporu(hasta_adi=hasta_adi, user_id=user.id)
+        db.session.add(yeni_rapor)
+        db.session.commit()
+        
+        for sonuc in sonuclar:
+            exists = TestParametresi.query.filter_by(rapor_id=yeni_rapor.id, tahlil_adi=sonuc["Tahlil Adı"]).first()
+            if not exists:
+                p = TestParametresi(tahlil_adi=sonuc["Tahlil Adı"], deger=sonuc["Değer"], birim=sonuc["Birim"], referans_araligi=sonuc["Referans Aralığı"], tahlil_tarihi=sonuc["Tarih"], rapor_id=yeni_rapor.id)
+                db.session.add(p)
+        db.session.commit()
+        
+        logger.info(f"Dosya başarıyla işlendi: {file.filename} (Kullanıcı: {username})")
+        return jsonify({"mesaj": "Başarılı"}), 201
+    except Exception as e: 
+        logger.error(f"Dosya yükleme hatası: {str(e)}")
+        return jsonify({"hata": str(e)}), 500
 
-@app.route('/profil', methods=['GET'])
-def profil():
-    user_id = request.args.get("user_id")
-    u = User.query.get(user_id)
-    if u:
-        return jsonify({
-            "username": u.username,
-            "cinsiyet": u.cinsiyet,
-            "dogum_yili": u.dogum_yili,
-            "hastaliklar": u.hastaliklar
-        })
-    return jsonify({"hata": "Profil bulunamadı"}), 404
+# --- TARİH SİLME FONKSİYONU ---
+@app.route('/delete_date', methods=['DELETE'])
+def delete_date_data():
+    username = request.args.get('username')
+    date = request.args.get('date')
 
-@app.route('/sohbet', methods=['POST'])
-def sohbet():
-    data = request.json
-    u_id = data.get("user_id")
-    soru = data.get("soru")
-    
-    user = User.query.get(u_id)
-    tahliller = TahlilVerisi.query.filter_by(kullanici_id=u_id).all()
-    
-    tahlil_metni = ""
-    for v in tahliller:
-        tahlil_metni += f"- {v.tarih}: {v.parametre} {v.deger} {v.birim} (Ref: {v.referans})\n"
-    
-    profil = f"Yaş: {2026 - user.dogum_yili}, Cinsiyet: {user.cinsiyet}, Hastalıklar: {user.hastaliklar}"
+    if not username or not date:
+        return jsonify({"hata": "Eksik parametre"}), 400
 
     try:
-        completion = client.chat.completions.create(
-            model="qwen-2.5-32b",
-            messages=[
-                {
-                    "role": "system", 
-                    "content": (
-                        "Sen uzman bir tahlil analiz asistanısın. Kullanıcının profilini "
-                        "ve geçmiş tahlillerini analiz ederek soruları yanıtla. "
-                        "Anlaşılır bir dil kullan ve riskli durumlarda doktora yönlendir.\n\n"
-                        f"HASTA PROFİLİ: {profil}\nSONUÇLAR:\n{tahlil_metni}"
-                    )
-                },
-                {"role": "user", "content": soru}
-            ]
-        )
-        return jsonify({"cevap": completion.choices[0].message.content})
+        silinecekler = db.session.query(TestParametresi).join(TahlilRaporu).join(User)\
+            .filter(User.username == username, TestParametresi.tahlil_tarihi == date).all()
+
+        if not silinecekler:
+            return jsonify({"mesaj": "Veri bulunamadı"}), 404
+
+        for kayit in silinecekler:
+            db.session.delete(kayit)
+        
+        db.session.commit()
+        logger.info(f"Silme başarılı: {date}")
+        return jsonify({"mesaj": f"{date} tarihli veriler silindi"}), 200
+
     except Exception as e:
-        return jsonify({"cevap": f"Bir hata oluştu: {str(e)}"}), 500
+        logger.error(f"Silme hatası: {str(e)}")
+        db.session.rollback()
+        return jsonify({"hata": str(e)}), 500
+
+# --- DİĞER VERİ FONKSİYONLARI ---
+@app.route('/all_parameters', methods=['GET'])
+def get_all_parameters():
+    username = request.args.get('username')
+    res = db.session.query(TestParametresi.tahlil_adi).join(TahlilRaporu).join(User)\
+            .filter(User.username == username).distinct().all()
+    return jsonify([r[0] for r in res]), 200
+
+@app.route('/results/<parameter_name>', methods=['GET'])
+def get_results(parameter_name):
+    username = request.args.get('username')
+    res = db.session.query(TestParametresi).join(TahlilRaporu).join(User)\
+            .filter(User.username == username, TestParametresi.tahlil_adi == parameter_name).all()
+            
+    res.sort(key=lambda x: datetime.strptime(x.tahlil_tarihi, "%d.%m.%Y"))
+    return jsonify([{"tarih": r.tahlil_tarihi, "deger": r.deger, "birim": r.birim, "referans": r.referans_araligi} for r in res]), 200
+
+@app.route('/comparison_matrix', methods=['GET'])
+def get_comparison_matrix():
+    username = request.args.get('username')
+    if not username: return jsonify({"hata": "Giriş gerekli"}), 401
+
+    try:
+        dates_q = db.session.query(TestParametresi.tahlil_tarihi).join(TahlilRaporu).join(User)\
+                    .filter(User.username == username).distinct().all()
+        dates = []
+        for d in dates_q:
+            try: dates.append(datetime.strptime(d[0], "%d.%m.%Y"))
+            except: pass
+        dates.sort(reverse=True)
+        str_dates = [d.strftime("%d.%m.%Y") for d in dates]
+
+        params_q = db.session.query(TestParametresi.tahlil_adi).join(TahlilRaporu).join(User)\
+                    .filter(User.username == username).distinct().all()
+        param_names = sorted([p[0] for p in params_q])
+
+        matrix_data = []
+        for p_name in param_names:
+            ref_kayit = db.session.query(TestParametresi).join(TahlilRaporu).join(User)\
+                        .filter(User.username == username, TestParametresi.tahlil_adi == p_name).first()
+            
+            row_data = {"isim": p_name, "referans": ref_kayit.referans_araligi if ref_kayit else "", "hucreler": []}
+            
+            for date in str_dates:
+                rec = db.session.query(TestParametresi).join(TahlilRaporu).join(User)\
+                        .filter(User.username == username, TestParametresi.tahlil_adi == p_name, TestParametresi.tahlil_tarihi == date).first()
+                
+                if rec: row_data["hucreler"].append({"deger": str(rec.deger), "riskli": is_abnormal(rec.deger, rec.referans_araligi)})
+                else: row_data["hucreler"].append({"deger": "-", "riskli": False})
+            matrix_data.append(row_data)
+
+        return jsonify({"sutunlar": str_dates, "satirlar": matrix_data}), 200
+    except Exception as e: 
+        logger.error(f"Matris oluşturma hatası: {str(e)}")
+        return jsonify({"hata": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    veritabani_baslat()
+    app.run(debug=True, host='0.0.0.0', port=5000)
