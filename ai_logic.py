@@ -10,6 +10,26 @@ load_dotenv()
 # Groq İstemcisini Başlat
 client = Groq()
 
+def temizle_markdown(metin):
+    if not metin:
+        return metin
+
+    # Kalın/italik markdown işaretlerini temizle
+    metin = metin.replace("**", "")
+    metin = metin.replace("__", "")
+    metin = metin.replace("*", "")
+
+    # Başlık işaretlerini temizle
+    metin = re.sub(r"^\s*#+\s*", "", metin, flags=re.MULTILINE)
+
+    # Satır başındaki madde işaretlerini temizle
+    metin = re.sub(r"^\s*-\s+", "", metin, flags=re.MULTILINE)
+
+    # Fazla boş satırları azalt
+    metin = re.sub(r"\n{3,}", "\n\n", metin)
+
+    return metin.strip()
+
 def belirle_niyet(soru):
     """
     1. AŞAMA: NİYET ANALİZİ (INTENT DETECTION)
@@ -102,6 +122,8 @@ KESİN KURALLAR:
         
         if not temiz_cevap:
             temiz_cevap = ham_cevap.replace("<think>", "").replace("</think>", "").strip()
+
+        temiz_cevap = temizle_markdown(temiz_cevap)
 
         return temiz_cevap
         
