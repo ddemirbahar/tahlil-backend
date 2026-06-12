@@ -31,17 +31,35 @@ def parse_pdf_data(pdf_stream):
             if not genel_tarih: genel_tarih = datetime.now().strftime("%d.%m.%Y")
 
             lines = full_text.split('\n')
+            # Satır yakalama kalıbı
             row_pattern = re.compile(r"^(?:(\d{1,2}\.\d{1,2}\.\d{4})\s+)?(.+?)\s+(\d+\.?\d*)\s+(\S+)\s+(.*)$")
 
             for line in lines:
                 match = row_pattern.search(line.strip())
                 if match:
                     isim = match.group(2).strip()
+                    
+                    # --- KRİTİK FİLTRELEME GÜNCELLEMESİ ---
+                    
+                    # 1. HARF KONTROLÜ: İsimde en az bir harf (a-z, A-Z) olmalı. 
+                    # Bu sayede "0", "0.38 -", ">=" gibi sadece rakam/sembol içeren çöpler elenir.
+                    if not any(c.isalpha() for c in isim): continue
+                    
+                    # 2. UZUNLUK VE ÖZEL KELİME KONTROLÜ
+                    if len(isim) > 45 or len(isim) < 2: continue
+                    
+                    yasakli = ["yaş altı", "trimestr", "trimester", "formülüne", "hesaplanmıştır", "dikkat", "0 850"]
+                    if any(k in isim.lower() for k in yasakli): continue
+                    
+                    # 3. SAYFA VE SAAT KONTROLLERİ
                     if "Sayfa" in line or "Saat" in isim: continue
+                    
                     sonuclar_listesi.append({
                         "Tarih": match.group(1) if match.group(1) else genel_tarih,
-                        "Tahlil Adı": isim, "Değer": float(match.group(3)),
-                        "Birim": match.group(4).strip(), "Referans Aralığı": match.group(5).strip()
+                        "Tahlil Adı": isim, 
+                        "Değer": float(match.group(3)),
+                        "Birim": match.group(4).strip(), 
+                        "Referans Aralığı": match.group(5).strip()
                     })
         return hasta_adi, sonuclar_listesi
     except Exception as e:
